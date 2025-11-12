@@ -138,8 +138,13 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
 
         inputs_embeds = self.llm.get_input_embeddings()(text_batch.input_ids) # [batch_size, max_len, dim]
         
-        inputs_embeds[text_batch.mol_token_flag] = \
-            query_output.flatten(0, 1).to(inputs_embeds.dtype) # [batch_size, max_len, dim]
+        batch_size = inputs_embeds.shape[0]
+        for i in range(batch_size):
+            if text_batch.mol_token_flag.sum(-1)[i] > 0:
+                inputs_embeds[i][text_batch.mol_token_flag[i]] = query_output[i].to(inputs_embeds.dtype)
+
+        #inputs_embeds[text_batch.mol_token_flag] = \
+        #    query_output.flatten(0, 1).to(inputs_embeds.dtype) # [batch_size, max_len, dim]
 
         outputs = self.llm.generate(
             inputs_embeds=inputs_embeds,
