@@ -2,7 +2,7 @@ import os
 import json
 from torch.utils.data import Dataset
 from data_provider.mol_dataset import MolDataset_cid
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
@@ -20,7 +20,8 @@ class MoleculeQADataset(Dataset):
 
         data_list = json.load(open(mol_path, 'r'))
         self.mol_dataset = MolDataset_cid(data_list, unimol_dict, encoder_type, max_atoms)
-        self.instruction_dataset = load_dataset("json", data_files=[json_path])['train'] 
+        #self.instruction_dataset = load_dataset("json", data_files=[json_path])['train'] 
+        self.instruction_dataset = load_from_disk(json_path.replace('.json', ''))
         self.mol_prompt = "<mol><mol><mol><mol><mol><mol><mol><mol>"
         self.graph_prompt = "<graph>" * 28
         self.mol_type = mol_type
@@ -34,7 +35,8 @@ class MoleculeQADataset(Dataset):
         text_data = self.instruction_dataset[index]
 
         cid = text_data['cid']
-        data_graphs, data_others = self.mol_dataset[cid]
+        #data_graphs, data_others = self.mol_dataset[cid]
+        data_graphs, data_others = self.mol_dataset[index]
         num_mols = len(data_graphs[list(data_graphs.keys())[0]])
 
         messages = []
@@ -64,6 +66,7 @@ class MoleculeQADataset(Dataset):
             "task": text_data['category'],
             "answer": answer,
             "smiles": text_data['smiles'],
+            "input_text": text_data['system'] + '\n' + user_prompt,
         }
 
         return data_graphs, messages, other_info
@@ -110,6 +113,7 @@ class MoleculeQADM(LightningDataModule):
             llama_version,
             num_workers,
             batch_size,
+            inference_batch_size,
             root,
             unimol_dictionary,
             encoder_types,
@@ -118,6 +122,7 @@ class MoleculeQADM(LightningDataModule):
         self.tokenizer = tokenizer
         self.llama_version = llama_version
         self.batch_size = batch_size
+        self.inference_batch_size = inference_batch_size
         self.num_workers = num_workers
         self.unimol_dictionary = unimol_dictionary
         self.encoder_types = encoder_types
@@ -161,7 +166,7 @@ class MoleculeQADM(LightningDataModule):
 
     def val_dataloader(self):
         loader = DataLoader(self.val_dataset,
-                            batch_size=self.batch_size*4,
+                            batch_size=self.inference_batch_size,
                             shuffle=False,
                             num_workers=self.num_workers,
                             pin_memory=False,
@@ -174,8 +179,8 @@ class MoleculeQADM(LightningDataModule):
 
     def test_dataloader(self):
         loader = DataLoader(self.test_dataset,
-                            batch_size=self.batch_size*4,
-                            shuffle=False,
+                            batch_size=self.inference_batch_size,
+                            shuffle=True,
                             num_workers=self.num_workers,
                             pin_memory=False,
                             drop_last=False,

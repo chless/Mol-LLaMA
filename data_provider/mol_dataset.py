@@ -105,7 +105,7 @@ class MolDataset_cid(Dataset):
         self.dictionary = dictionary
         
         self.data_list = data_list
-        self.cid2idx = {data['cid']:idx for idx, data in enumerate(self.data_list)}
+        #self.cid2idx = {data['cid']:idx for idx, data in enumerate(self.data_list)}
         self.encoder_types = encoder_types
         
         self.max_atoms = max_atoms
@@ -114,7 +114,8 @@ class MolDataset_cid(Dataset):
         return len(self.data_list)
 
     def __getitem__(self, cid):
-        idx = self.cid2idx[cid]
+        #idx = self.cid2idx[cid]
+        idx = cid
         data = self.data_list[idx]
         data_atoms = [data['atoms']]
         data_coordinates = data['coordinates']

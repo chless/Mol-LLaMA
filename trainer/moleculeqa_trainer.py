@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 from torch_geometric.data import Batch
 
 from trainer.optims import LinearWarmupCosineLRScheduler
+import torch.distributed as dist
 
 def load_ignore_unexpected(model, state_dict):
     keys = set(model.state_dict().keys())
@@ -123,6 +124,7 @@ class MoleculeQATrainer(pl.LightningModule):
                 new_text_batch,
                 pad_token_id = self.tokenizer.pad_token_id,
                 eos_token_id = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids('<|eot_id|>')],
+                max_new_tokens=self.data_config.max_new_tokens,
             )
             new_generated_texts = self.tokenizer.batch_decode(new_responses, skip_special_tokens=True)
 
@@ -160,62 +162,59 @@ class MoleculeQATrainer(pl.LightningModule):
     @torch.no_grad()
     def test_step(self, batch, batch_idx):
         graph_batch, text_batch, other_infos = batch
-        responses = self.mol_llama.generate(
+        texts = other_infos['answer']
+        tasks = other_infos['task']
+        input_texts = other_infos['input_text']
+
+        outputs = self.mol_llama.generate(
             graph_batch, 
             text_batch,
             pad_token_id = self.tokenizer.pad_token_id,
             eos_token_id = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids('<|eot_id|>')],
         )
-        generated_texts = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
-        original_texts = self.tokenizer.batch_decode(text_batch['input_ids'], skip_special_tokens=False)
-        pattern = r"[Aa]nswer:"
+        prediction_ids = outputs.sequences
 
-        # Generate further if the output does not contain "Answer:"
-        no_format_indices = []
-        new_texts = []
-        for idx, (original_text, generated_text) in enumerate(zip(original_texts, generated_texts)):
-            if not re.search(pattern, generated_text):
-                no_format_indices.append(idx)
-                new_texts.append(original_text + generated_text + "\n\nAnswer: ")
-        if len(no_format_indices) > 0:
-            new_graph_batch = {"unimol": {}, "moleculestm": {}}
-            new_text_batch = {}
-            for k, v in graph_batch['unimol'].items():
-                new_graph_batch['unimol'][k] = v[no_format_indices]
-            new_graph_batch['moleculestm'] = Batch.from_data_list(graph_batch['moleculestm'].index_select(no_format_indices))
+        predictions = self.tokenizer.batch_decode(prediction_ids, skip_special_tokens=True)
+        predictions = [pred.strip() for pred in predictions]
 
-            new_text_batch = self.tokenizer(
-                new_texts,
-                truncation=False,
-                padding="longest",
-                return_tensors="pt",
-                return_attention_mask=True,
-                return_token_type_ids=False,
-                add_special_tokens=False,
-            ).to(self.device)
-            new_text_batch.mol_token_flag = (new_text_batch.input_ids == self.tokenizer.mol_token_id).to(self.device)
+        binary_classificaiton_probs = convert_logit2binary_prob(outputs.logits, self.tokenizer, tasks)
 
-            new_responses = self.mol_llama.generate(
-                new_graph_batch, 
-                new_text_batch,
-                pad_token_id = self.tokenizer.pad_token_id,
-                eos_token_id = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids('<|eot_id|>')],
-            )
-            new_generated_texts = self.tokenizer.batch_decode(new_responses, skip_special_tokens=True)
+        save_dict = {
+            'tasks': tasks,
+            'input_texts': input_texts,
+            'targets': texts,
+            'predictions': predictions,
+            'binary_classificaiton_probs': binary_classificaiton_probs,
+        }
+        # save tokenizer
+        tokenizer_path = os.path.join(self.logger.log_dir)
+        self.tokenizer.save_pretrained(tokenizer_path)
 
-            for _, i in enumerate(no_format_indices):
-                generated_texts[i] += "\n\nAnswer: " + new_generated_texts[_]
+        self.save_predictions(**save_dict)
 
+    def save_predictions(self, **kwargs):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        keys = list(kwargs.keys())
+        len_dump = len(kwargs[keys[0]])
+        for k in keys:
+            assert len(kwargs[k]) == len_dump
 
+        filepath = os.path.join(self.logger.log_dir, f'dumps_rank_{rank}.json')
+        # load the previous dumps from filepath
+        if os.path.exists(filepath):
+            # read jsonl file
+            with open(filepath, 'r', encoding='utf8') as f:
+                cumulative_dumps = json.load(f)
+        else:
+            cumulative_dumps = []
 
-        for response, answer, task in zip(generated_texts, other_infos['answer'], other_infos['task']):
-            self.test_step_outputs.append({
-                'response': response,
-                'answer': answer,
-                'task': task
-            })
+        for i in range(len_dump):
+            line = {k: kwargs[k][i] for k in keys}
+            cumulative_dumps.append(line)
 
-        return responses
+        with open(filepath, 'w', encoding='utf8') as f:
+            # save json file
+            json.dump(cumulative_dumps, f, ensure_ascii=True, indent=4)
 
     def on_test_epoch_end(self):
         outputs = self.test_step_outputs
@@ -283,3 +282,65 @@ class MoleculeQATrainer(pl.LightningModule):
 
         return corrects, results
 
+import torch
+
+def convert_logit2binary_prob(logits, tokenizer, tasks):
+    """Convert model logits into binary classification probabilities (True / False)."""
+
+    classification_classes = {
+        'bace',
+        'smol-property_prediction-bbbp',
+        'smol-property_prediction-clintox',
+        'smol-property_prediction-hiv',
+        'smol-property_prediction-sider',
+    }
+
+    # Create mask for which tasks are binary classification tasks
+    classification_masks = [any(cls in task for cls in classification_classes) for task in tasks]
+    classification_masks = torch.tensor(classification_masks, dtype=torch.bool, device=logits.device).unsqueeze(1)
+
+    # Prepare token IDs (move them to same device as logits)
+    positive_tokens = ["True", "true", "TRUE", "yes", "Yes", "YES"]
+    negative_tokens = ["False", "false", "FALSE", "no", "No", "NO"]
+
+    positive_token_ids = [tokenizer.encode(tok)[1] for tok in positive_tokens]
+    negative_token_ids = [tokenizer.encode(tok)[1] for tok in negative_tokens]
+
+    # Convert to tensors on same device
+    positive_token_ids = torch.tensor(positive_token_ids, dtype=torch.long, device=logits.device)
+    negative_token_ids = torch.tensor(negative_token_ids, dtype=torch.long, device=logits.device)
+
+    # Compute probabilities
+    probs = logits.softmax(dim=-1)
+    batch_size, seq_len, _ = probs.size()
+
+    false_logits = torch.zeros(batch_size, 1, device=logits.device)
+    true_logits = torch.zeros(batch_size, 1, device=logits.device)
+    target_logits_index = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+
+    for i in range(batch_size):
+        logits_i = logits[i]
+        prediction_ids_i = logits_i.argmax(dim=-1)  # shape: [seq_len]
+
+        # Find indices of any tokens matching positive/negative token IDs
+        mask_match = torch.isin(prediction_ids_i, torch.cat((positive_token_ids, negative_token_ids)))
+
+        if mask_match.any():
+            first_match_idx = torch.nonzero(mask_match, as_tuple=False)[0, 0]
+            target_logits_index[i] = first_match_idx
+        else:
+            target_logits_index[i] = 0
+
+        # Use .sum() properly across the vocabulary dim
+        false_logits[i] = probs[i, target_logits_index[i], negative_token_ids].sum()
+        true_logits[i]  = probs[i, target_logits_index[i], positive_token_ids].sum()
+
+    # Stack probabilities and normalize
+    total_probs = torch.cat([false_logits, true_logits], dim=-1)
+    total_probs = total_probs.softmax(dim=-1)
+
+    # Fill non-classification tasks with -1
+    total_probs = torch.where(classification_masks, total_probs, torch.full_like(total_probs, -1.0))
+
+    # Convert to list for output
+    return total_probs.tolist()

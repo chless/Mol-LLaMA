@@ -3,3 +3,5 @@ __pycache__/
 */__pycache__/
 */*/__pycache__/
 Uni-Core/
+data
+.vscode
